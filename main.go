@@ -16,20 +16,26 @@ import (
 	"github.com/spf13/viper"
 	"github.com/xyproto/env/v2"
 	"golang.org/x/oauth2"
+	"gopkg.in/yaml.v2"
 )
 
 type RepoConfig struct {
-	SourceRepoName string `mapstructure:"source_repo_name"`
-	FilePath       string `mapstructure:"file_path"`
-	TargetRepoName string `mapstructure:"target_repo_name"`
-	Since          string `mapstructure:"since"`
+	SourceRepoName string `mapstructure:"source_repo_name" yaml:"source_repo_name"`
+	FilePath       string `mapstructure:"file_path" yaml:"file_path"`
+	TargetRepoName string `mapstructure:"target_repo_name" yaml:"target_repo_name"`
+	Since          string `mapstructure:"since" yaml:"since"`
 	LastChecked    time.Time
+}
+
+type Config struct {
+	Repos []RepoConfig `mapstructure:"repos" yaml:"repos"`
 }
 
 type Server struct {
 	githubClient *github.Client
 	repoConfigs  []RepoConfig
 	mu           sync.Mutex // Protects manual check trigger
+	configPath   string     // Path to config.toml
 }
 
 func main() {
@@ -51,6 +57,7 @@ func main() {
 	server := &Server{
 		githubClient: githubClient,
 		repoConfigs:  config.Repos,
+		configPath:   viper.ConfigFileUsed(),
 	}
 
 	// Set up signal handling for manual checks and graceful shutdown
@@ -107,10 +114,6 @@ func loadConfig() (*Config, error) {
 	}
 
 	return &config, nil
-}
-
-type Config struct {
-	Repos []RepoConfig `mapstructure:"repos"`
 }
 
 func (c *Config) validate() error {
@@ -192,6 +195,7 @@ func (s *Server) checkRepos() {
 			} else {
 				log.Printf("Created pull request for repo %s", config.TargetRepoName)
 				s.repoConfigs[i].LastChecked = time.Now()
+				s.updateSinceInConfig(i)
 			}
 		} else {
 			log.Printf("No new commits found for %s in repo %s.", config.FilePath, config.SourceRepoName)
@@ -273,6 +277,26 @@ func (s *Server) createPullRequest(ctx context.Context, targetRepoName, filePath
 
 	_, _, err = s.githubClient.PullRequests.Create(ctx, owner, repo, newPR)
 	return err
+}
+
+func (s *Server) updateSinceInConfig(index int) {
+	s.repoConfigs[index].Since = s.repoConfigs[index].LastChecked.Format("2006-01-02T15:04:05Z07:00")
+
+	config := Config{
+		Repos: s.repoConfigs,
+	}
+
+	configData, err := yaml.Marshal(config)
+	if err != nil {
+		log.Printf("Error marshaling config to YAML: %v", err)
+		return
+	}
+
+	if err := os.WriteFile(s.configPath, configData, 0644); err != nil {
+		log.Printf("Error writing updated config to file: %v", err)
+	} else {
+		log.Printf("Updated 'since' time in config.toml for repo %s.", s.repoConfigs[index].SourceRepoName)
+	}
 }
 
 func parseRepoName(fullRepoName string) (owner, repo string) {
