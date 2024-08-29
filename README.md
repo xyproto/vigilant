@@ -24,6 +24,16 @@ export GITHUB_TOKEN="asdfasdf" # your GitHub token with rights to read public da
 ./vigilant
 ```
 
+## Triggering a pull request manually
+
+```bash
+pkill -USR1 vigilant
+```
+
+## Unusual behavior
+
+* When a new pull request is made, the `since` field in `config.toml` is also updated.
+
 ## General info
 
 * Version: 0.0.1
