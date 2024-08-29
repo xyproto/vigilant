@@ -7,26 +7,29 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/google/go-github/v50/github"
 	"github.com/spf13/viper"
+	"github.com/xyproto/env/v2"
 	"golang.org/x/oauth2"
 )
 
 type RepoConfig struct {
-	SourceRepoName string
-	FilePath       string
-	TargetRepoName string
-	Since          string
+	SourceRepoName string `mapstructure:"source_repo_name"`
+	FilePath       string `mapstructure:"file_path"`
+	TargetRepoName string `mapstructure:"target_repo_name"`
+	Since          string `mapstructure:"since"`
 	LastChecked    time.Time
 }
 
 type Server struct {
 	githubClient *github.Client
 	repoConfigs  []RepoConfig
+	mu           sync.Mutex // Protects manual check trigger
 }
 
 func main() {
@@ -36,17 +39,40 @@ func main() {
 		log.Fatalf("Error loading config: %v", err)
 	}
 
+	// Read GITHUB_TOKEN from the environment
+	githubToken := env.Str("GITHUB_TOKEN", "")
+	if githubToken == "" {
+		log.Fatal("GITHUB_TOKEN environment variable is required")
+	}
+
 	// Set up GitHub client
-	githubClient := newGitHubClient(config.GitHubToken)
+	githubClient := newGitHubClient(githubToken)
 
 	server := &Server{
 		githubClient: githubClient,
 		repoConfigs:  config.Repos,
 	}
 
-	// Set up signal handling for graceful shutdown
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// Set up signal handling for manual checks and graceful shutdown
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGUSR1, syscall.SIGTERM, syscall.SIGINT)
+
+	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
+
+	go func() {
+		for sig := range sigs {
+			switch sig {
+			case syscall.SIGUSR1:
+				log.Println("Received SIGUSR1, manually triggering repository check...")
+				server.triggerManualCheck()
+			case syscall.SIGTERM, syscall.SIGINT:
+				log.Println("Received termination signal, shutting down...")
+				stop()
+				return
+			}
+		}
+	}()
 
 	// Run the server
 	server.Run(ctx)
@@ -84,14 +110,10 @@ func loadConfig() (*Config, error) {
 }
 
 type Config struct {
-	GitHubToken string       `mapstructure:"GITHUB_TOKEN"`
-	Repos       []RepoConfig `mapstructure:"repos"`
+	Repos []RepoConfig `mapstructure:"repos"`
 }
 
 func (c *Config) validate() error {
-	if c.GitHubToken == "" {
-		return errors.New("GITHUB_TOKEN is required")
-	}
 	if len(c.Repos) == 0 {
 		return errors.New("at least one repo configuration is required")
 	}
@@ -145,8 +167,17 @@ func (s *Server) Run(ctx context.Context) {
 	}
 }
 
+func (s *Server) triggerManualCheck() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	go s.checkRepos()
+}
+
 func (s *Server) checkRepos() {
+	log.Println("Checking repositories for updates...")
 	for i, config := range s.repoConfigs {
+		log.Printf("Checking repo %s for changes in %s...", config.SourceRepoName, config.FilePath)
 		newCommits, err := s.checkRepo(config.SourceRepoName, config.FilePath, config.LastChecked)
 		if err != nil {
 			log.Printf("Error checking repo %s: %v", config.SourceRepoName, err)
@@ -154,6 +185,7 @@ func (s *Server) checkRepos() {
 		}
 
 		if len(newCommits) > 0 {
+			log.Printf("Found %d new commit(s) in %s. Creating pull request...", len(newCommits), config.FilePath)
 			err := s.createPullRequest(context.Background(), config.TargetRepoName, config.FilePath, newCommits)
 			if err != nil {
 				log.Printf("Error creating pull request for repo %s: %v", config.TargetRepoName, err)
@@ -161,17 +193,21 @@ func (s *Server) checkRepos() {
 				log.Printf("Created pull request for repo %s", config.TargetRepoName)
 				s.repoConfigs[i].LastChecked = time.Now()
 			}
+		} else {
+			log.Printf("No new commits found for %s in repo %s.", config.FilePath, config.SourceRepoName)
 		}
 	}
 }
 
 func (s *Server) checkRepo(repoName, filePath string, lastChecked time.Time) ([]*github.RepositoryCommit, error) {
+	owner, repo := parseRepoName(repoName)
+
 	opts := &github.CommitsListOptions{
 		Path:  filePath,
 		Since: lastChecked,
 	}
 
-	commits, _, err := s.githubClient.Repositories.ListCommits(context.Background(), "", repoName, opts)
+	commits, _, err := s.githubClient.Repositories.ListCommits(context.Background(), owner, repo, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -187,16 +223,18 @@ func (s *Server) checkRepo(repoName, filePath string, lastChecked time.Time) ([]
 }
 
 func (s *Server) createPullRequest(ctx context.Context, targetRepoName, filePath string, commits []*github.RepositoryCommit) error {
-	branchName := "xxd-update-" + time.Now().Format("20060102-150405")
+	owner, repo := parseRepoName(targetRepoName)
+
+	branchName := fmt.Sprintf("%s-update-%s", strings.ReplaceAll(filePath, "/", "-"), time.Now().Format("20060102-150405"))
 	title := fmt.Sprintf("Update: Changes in %s", filePath)
 	body := fmt.Sprintf("This pull request notifies that there have been changes to `%s` in the source repository.\n\n", filePath)
 
 	for _, commit := range commits {
-		body += fmt.Sprintf("- [%s](%s) - %s\n", commit.Commit.Message, commit.HTMLURL, commit.Commit.Author.Date)
+		body += fmt.Sprintf("- [%s](%s) - %s\n", *commit.Commit.Message, *commit.HTMLURL, commit.Commit.Author.Date.Format(time.RFC1123))
 	}
 
 	// Create a new branch
-	ref, _, err := s.githubClient.Git.GetRef(ctx, "", targetRepoName, "refs/heads/main")
+	ref, _, err := s.githubClient.Git.GetRef(ctx, owner, repo, "refs/heads/main")
 	if err != nil {
 		return err
 	}
@@ -206,21 +244,21 @@ func (s *Server) createPullRequest(ctx context.Context, targetRepoName, filePath
 		Object: ref.Object,
 	}
 
-	_, _, err = s.githubClient.Git.CreateRef(ctx, "", targetRepoName, newRef)
+	_, _, err = s.githubClient.Git.CreateRef(ctx, owner, repo, newRef)
 	if err != nil {
 		return err
 	}
 
 	// Create a notification file or update existing file
-	filename := "xxd-updates.md"
+	filename := strings.ReplaceAll(filePath, "/", "-") + "-updates.md"
 	fileContent := []byte(body)
 	opts := &github.RepositoryContentFileOptions{
-		Message: github.String("Notify about changes to xxd.c"),
+		Message: github.String(fmt.Sprintf("Notify about changes to %s", filePath)),
 		Content: fileContent,
 		Branch:  github.String(branchName),
 	}
 
-	_, _, err = s.githubClient.Repositories.CreateFile(ctx, "", targetRepoName, filename, opts)
+	_, _, err = s.githubClient.Repositories.CreateFile(ctx, owner, repo, filename, opts)
 	if err != nil {
 		return err
 	}
@@ -233,6 +271,14 @@ func (s *Server) createPullRequest(ctx context.Context, targetRepoName, filePath
 		Body:  github.String(body),
 	}
 
-	_, _, err = s.githubClient.PullRequests.Create(ctx, "", targetRepoName, newPR)
+	_, _, err = s.githubClient.PullRequests.Create(ctx, owner, repo, newPR)
 	return err
+}
+
+func parseRepoName(fullRepoName string) (owner, repo string) {
+	parts := strings.Split(fullRepoName, "/")
+	if len(parts) != 2 {
+		log.Fatalf("Invalid repository name: %s", fullRepoName)
+	}
+	return parts[0], parts[1]
 }
