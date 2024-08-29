@@ -1,6 +1,6 @@
-# vigilant
+# Vigilant
 
-A utility that can be used to monitor changes in a source file in one repo and then create pull requests in another.
+Vigilant is a utility that can be used to monitor changes in a source file in one repo and then create pull requests in another.
 
 ## Building
 
@@ -30,11 +30,13 @@ export GITHUB_TOKEN="asdfasdf" # your GitHub token with rights to read public da
 pkill -USR1 vigilant
 ```
 
-## Unusual behavior
+## Extra notes
 
 * When a new pull request is made, the `since` field in `config.toml` is also updated.
+* The Vigilant server checks for changes every 10 minutes.
 
 ## General info
 
+* Author: Alexander F. Rødseth &lt;xyproto@archlinux.org&gt;
 * Version: 0.0.1
 * License: MIT
