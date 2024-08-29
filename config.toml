@@ -1,0 +1,5 @@
+[[repos]]
+source_repo_name = "vim/vim"
+file_path = "src/xxd/xxd.c"
+target_repo_name = "xyproto/tinyxxd"
+since = "2024-08-29"

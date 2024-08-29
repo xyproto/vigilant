@@ -1,0 +1,8 @@
+*.bak
+*.o
+*.swp
+*.tmp
+.DS_Store
+include.txt
+vigilant
+run.sh
