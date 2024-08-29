@@ -37,6 +37,6 @@ pkill -USR1 vigilant
 
 ## General info
 
-* Author: Alexander F. Rødseth &lt;xyproto@archlinux.org&gt;
 * Version: 0.0.1
 * License: MIT
+* Author: Alexander F. Rødseth &lt;xyproto@archlinux.org&gt;
