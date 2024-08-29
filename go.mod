@@ -7,6 +7,7 @@ require (
 	github.com/spf13/viper v1.19.0
 	github.com/xyproto/env/v2 v2.5.0
 	golang.org/x/oauth2 v0.22.0
+	gopkg.in/yaml.v2 v2.4.0
 )
 
 require (
