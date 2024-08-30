@@ -30,13 +30,8 @@ export GITHUB_TOKEN="asdfasdf" # your GitHub token with rights to read public da
 pkill -USR1 vigilant
 ```
 
-## Extra notes
-
-* When a new pull request is made, the `since` field in `config.toml` is also updated.
-* The Vigilant server checks for changes every 10 minutes.
-
 ## General info
 
-* Version: 0.0.1
+* Version: 1.0.0
 * License: MIT
 * Author: Alexander F. Rødseth &lt;xyproto@archlinux.org&gt;
