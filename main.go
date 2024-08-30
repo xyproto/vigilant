@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,31 +18,35 @@ import (
 	"github.com/spf13/viper"
 	"github.com/xyproto/env/v2"
 	"golang.org/x/oauth2"
-	"gopkg.in/yaml.v2"
 )
 
 type RepoConfig struct {
-	SourceRepoName string `mapstructure:"source_repo_name" yaml:"source_repo_name"`
-	FilePath       string `mapstructure:"file_path" yaml:"file_path"`
-	TargetRepoName string `mapstructure:"target_repo_name" yaml:"target_repo_name"`
-	Since          string `mapstructure:"since" yaml:"since"`
-	LastChecked    time.Time
+	SourceRepoName        string `mapstructure:"source_repo_name"`
+	FilePath              string `mapstructure:"file_path"`
+	TargetRepoName        string `mapstructure:"target_repo_name"`
+	PullRequestBaseBranch string `mapstructure:"pull_request_base_branch"`
 }
 
 type Config struct {
-	Repos []RepoConfig `mapstructure:"repos" yaml:"repos"`
+	PollInterval int          `mapstructure:"poll_interval"`
+	Repos        []RepoConfig `mapstructure:"repos"`
 }
 
 type Server struct {
 	githubClient *github.Client
 	repoConfigs  []RepoConfig
-	mu           sync.Mutex // Protects manual check trigger
-	configPath   string     // Path to config.toml
+	mu           sync.Mutex
+	cachePath    string
+	pollInterval time.Duration
+	lastChecked  time.Time
 }
 
 func main() {
+	// Determine cache directory based on OS
+	cacheDir := getCacheDir()
+
 	// Load and validate configuration
-	config, err := loadConfig()
+	config, err := loadConfig(cacheDir)
 	if err != nil {
 		log.Fatalf("Error loading config: %v", err)
 	}
@@ -57,8 +63,12 @@ func main() {
 	server := &Server{
 		githubClient: githubClient,
 		repoConfigs:  config.Repos,
-		configPath:   viper.ConfigFileUsed(),
+		cachePath:    filepath.Join(cacheDir, "since.timestamp"),
+		pollInterval: time.Duration(config.PollInterval) * time.Minute,
 	}
+
+	// Initialize the since.timestamp file if it doesn't exist
+	server.initSinceFile()
 
 	// Set up signal handling for manual checks and graceful shutdown
 	sigs := make(chan os.Signal, 1)
@@ -85,14 +95,44 @@ func main() {
 	server.Run(ctx)
 }
 
-func loadConfig() (*Config, error) {
-	viper.SetConfigName("config")
-	viper.SetConfigType("toml")
-	viper.AddConfigPath(".")
-	viper.AutomaticEnv()
+func getCacheDir() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("Failed to get home directory: %v", err)
+	}
 
-	if err := viper.ReadInConfig(); err != nil {
-		return nil, fmt.Errorf("error reading config file: %w", err)
+	switch runtime.GOOS {
+	case "darwin":
+		return filepath.Join(homeDir, "Library", "Caches", "vigilant")
+	case "linux":
+		return filepath.Join(homeDir, ".cache", "vigilant")
+	default:
+		log.Fatalf("Unsupported OS: %s", runtime.GOOS)
+		return ""
+	}
+}
+
+func loadConfig(cacheDir string) (*Config, error) {
+	viper.SetConfigType("toml")
+
+	// Define the search paths for the config file
+	configPaths := []string{
+		"/etc/vigilant",
+		filepath.Join(os.Getenv("HOME"), ".config/vigilant"),
+		".",
+	}
+
+	var configPath string
+	for _, path := range configPaths {
+		viper.AddConfigPath(path)
+		if err := viper.ReadInConfig(); err == nil {
+			configPath = viper.ConfigFileUsed()
+			break
+		}
+	}
+
+	if configPath == "" {
+		return nil, fmt.Errorf("could not find config.toml in any of the expected locations")
 	}
 
 	var config Config
@@ -104,19 +144,46 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config validation failed: %w", err)
 	}
 
-	// Parse the 'since' date into time.Time format
-	for i := range config.Repos {
-		parsedSince, err := time.Parse("2006-01-02", config.Repos[i].Since)
-		if err != nil {
-			return nil, fmt.Errorf("invalid date format for 'since': %w", err)
-		}
-		config.Repos[i].LastChecked = parsedSince
+	// Create cache directory if it doesn't exist
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
 	return &config, nil
 }
 
+func (s *Server) initSinceFile() {
+	// Check if since.timestamp exists
+	if _, err := os.Stat(s.cachePath); os.IsNotExist(err) {
+		// Create default since.timestamp with current time
+		log.Println("Creating default since.timestamp...")
+		s.lastChecked = time.Now()
+		s.updateSinceInCache()
+	} else {
+		// Load existing since.timestamp
+		s.loadSinceValue()
+	}
+}
+
+func (s *Server) loadSinceValue() {
+	data, err := os.ReadFile(s.cachePath)
+	if err != nil {
+		log.Printf("Could not read since.timestamp: %v. Assuming first run.", err)
+		s.lastChecked = time.Now()
+		return
+	}
+
+	s.lastChecked, err = time.Parse(time.RFC3339, strings.TrimSpace(string(data)))
+	if err != nil {
+		log.Printf("Error parsing since.timestamp: %v. Using current time.", err)
+		s.lastChecked = time.Now()
+	}
+}
+
 func (c *Config) validate() error {
+	if c.PollInterval <= 0 {
+		return errors.New("poll_interval must be greater than zero")
+	}
 	if len(c.Repos) == 0 {
 		return errors.New("at least one repo configuration is required")
 	}
@@ -130,8 +197,8 @@ func (c *Config) validate() error {
 		if repo.TargetRepoName == "" {
 			return errors.New("each repo configuration must have a TargetRepoName")
 		}
-		if repo.Since == "" {
-			return errors.New("each repo configuration must have a Since date")
+		if repo.PullRequestBaseBranch == "" {
+			return errors.New("each repo configuration must have a PullRequestBaseBranch")
 		}
 	}
 	return nil
@@ -148,7 +215,7 @@ func newGitHubClient(token string) *github.Client {
 
 func (s *Server) Run(ctx context.Context) {
 	log.Println("Starting server...")
-	ticker := time.NewTicker(10 * time.Minute)
+	ticker := time.NewTicker(s.pollInterval)
 	defer ticker.Stop()
 
 	var wg sync.WaitGroup
@@ -163,7 +230,7 @@ func (s *Server) Run(ctx context.Context) {
 			}()
 		case <-ctx.Done():
 			log.Println("Shutting down server...")
-			wg.Wait() // Wait for all goroutines to finish
+			wg.Wait()
 			log.Println("Server stopped.")
 			return
 		}
@@ -179,9 +246,9 @@ func (s *Server) triggerManualCheck() {
 
 func (s *Server) checkRepos() {
 	log.Println("Checking repositories for updates...")
-	for i, config := range s.repoConfigs {
+	for _, config := range s.repoConfigs {
 		log.Printf("Checking repo %s for changes in %s...", config.SourceRepoName, config.FilePath)
-		newCommits, err := s.checkRepo(config.SourceRepoName, config.FilePath, config.LastChecked)
+		newCommits, err := s.checkRepo(config.SourceRepoName, config.FilePath, s.lastChecked)
 		if err != nil {
 			log.Printf("Error checking repo %s: %v", config.SourceRepoName, err)
 			continue
@@ -189,13 +256,13 @@ func (s *Server) checkRepos() {
 
 		if len(newCommits) > 0 {
 			log.Printf("Found %d new commit(s) in %s. Creating pull request...", len(newCommits), config.FilePath)
-			err := s.createPullRequest(context.Background(), config.TargetRepoName, config.FilePath, newCommits)
+			err := s.createPullRequest(context.Background(), config.TargetRepoName, config.FilePath, config.PullRequestBaseBranch, newCommits)
 			if err != nil {
 				log.Printf("Error creating pull request for repo %s: %v", config.TargetRepoName, err)
 			} else {
 				log.Printf("Created pull request for repo %s", config.TargetRepoName)
-				s.repoConfigs[i].LastChecked = time.Now()
-				s.updateSinceInConfig(i)
+				s.lastChecked = time.Now()
+				s.updateSinceInCache()
 			}
 		} else {
 			log.Printf("No new commits found for %s in repo %s.", config.FilePath, config.SourceRepoName)
@@ -226,7 +293,7 @@ func (s *Server) checkRepo(repoName, filePath string, lastChecked time.Time) ([]
 	return newCommits, nil
 }
 
-func (s *Server) createPullRequest(ctx context.Context, targetRepoName, filePath string, commits []*github.RepositoryCommit) error {
+func (s *Server) createPullRequest(ctx context.Context, targetRepoName, filePath, baseBranch string, commits []*github.RepositoryCommit) error {
 	owner, repo := parseRepoName(targetRepoName)
 
 	branchName := fmt.Sprintf("%s-update-%s", strings.ReplaceAll(filePath, "/", "-"), time.Now().Format("20060102-150405"))
@@ -238,7 +305,7 @@ func (s *Server) createPullRequest(ctx context.Context, targetRepoName, filePath
 	}
 
 	// Create a new branch
-	ref, _, err := s.githubClient.Git.GetRef(ctx, owner, repo, "refs/heads/main")
+	ref, _, err := s.githubClient.Git.GetRef(ctx, owner, repo, fmt.Sprintf("refs/heads/%s", baseBranch))
 	if err != nil {
 		return err
 	}
@@ -271,7 +338,7 @@ func (s *Server) createPullRequest(ctx context.Context, targetRepoName, filePath
 	newPR := &github.NewPullRequest{
 		Title: github.String(title),
 		Head:  github.String(branchName),
-		Base:  github.String("main"),
+		Base:  github.String(baseBranch),
 		Body:  github.String(body),
 	}
 
@@ -279,23 +346,13 @@ func (s *Server) createPullRequest(ctx context.Context, targetRepoName, filePath
 	return err
 }
 
-func (s *Server) updateSinceInConfig(index int) {
-	s.repoConfigs[index].Since = s.repoConfigs[index].LastChecked.Format("2006-01-02T15:04:05Z07:00")
-
-	config := Config{
-		Repos: s.repoConfigs,
-	}
-
-	configData, err := yaml.Marshal(config)
-	if err != nil {
-		log.Printf("Error marshaling config to YAML: %v", err)
-		return
-	}
-
-	if err := os.WriteFile(s.configPath, configData, 0644); err != nil {
-		log.Printf("Error writing updated config to file: %v", err)
+func (s *Server) updateSinceInCache() {
+	// Write the lastChecked time to since.timestamp
+	data := s.lastChecked.Format(time.RFC3339)
+	if err := os.WriteFile(s.cachePath, []byte(data), 0644); err != nil {
+		log.Printf("Error writing updated since.timestamp to file: %v", err)
 	} else {
-		log.Printf("Updated 'since' time in config.toml for repo %s.", s.repoConfigs[index].SourceRepoName)
+		log.Printf("Updated last checked time in since.timestamp: %s", data)
 	}
 }
 
