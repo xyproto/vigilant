@@ -67,6 +67,8 @@ func main() {
 		pollInterval: time.Duration(config.PollInterval) * time.Minute,
 	}
 
+	log.Printf("Polling every %d minutes.\n", config.PollInterval)
+
 	// Initialize the since.timestamp file if it doesn't exist
 	server.initSinceFile()
 
