@@ -1,8 +1,7 @@
-poll_interval = 10 # minutes
+poll_interval = 120 # minutes
 
 [[repos]]
-#source_repo_name = "vim/vim"
-source_repo_name = "xyproto/vim"
+source_repo_name = "vim/vim"
 file_path = "src/xxd/xxd.c"
 target_repo_name = "xyproto/tinyxxd"
 pull_request_base_branch = "main"
